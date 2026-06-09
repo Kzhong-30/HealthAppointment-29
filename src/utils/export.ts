@@ -103,8 +103,34 @@ module.exports = {
   downloadFile(tailwind, 'tailwind.config.extended.js', 'application/javascript')
 }
 
+interface FigmaTokenBase {
+  $type: string
+  $value: unknown
+}
+
+interface FigmaTokenGroup {
+  [key: string]: FigmaTokenBase | FigmaTokenGroup
+}
+
+interface FigmaTokensRoot {
+  $schema: string
+  _: { version: string; name: string }
+  global: {
+    color: { primary: FigmaTokenGroup; secondary: FigmaTokenGroup; neutral: FigmaTokenGroup }
+    typography: {
+      fontFamily: FigmaTokenGroup
+      fontSize: FigmaTokenGroup
+      lineHeight: FigmaTokenGroup
+    }
+    spacing: FigmaTokenGroup
+    borderRadius: FigmaTokenGroup
+    boxShadow: FigmaTokenGroup
+  }
+  [key: string]: unknown
+}
+
 export function exportFigmaTokens(config: DesignSystemConfig) {
-  const tokens: Record<string, any> = {
+  const tokens: FigmaTokensRoot = {
     $schema: 'https://schemas.tokens.studio/v1.json',
     _: {
       version: config.version,

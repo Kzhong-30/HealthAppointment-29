@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
-import { useDesignConfig } from './composables/useDesignConfig'
+import { computed, ref } from 'vue'
+import { useScopedDesignConfig } from './composables/useDesignConfig'
+import type { ExportFormat } from './types'
 import ConfigPanel from './components/ConfigPanel.vue'
 import ColorSystem from './components/ColorSystem.vue'
 import TypographySystem from './components/TypographySystem.vue'
@@ -14,21 +15,24 @@ import {
   exportPDF
 } from './utils/export'
 
+const store = useScopedDesignConfig()
+
 const {
   config,
+  me,
+  otherCollaborators,
   collaborators,
-  userId,
   isCollaborationEnabled,
+  isConnected,
   resetConfig,
-  updateConfig,
   initCollaboration
-} = useDesignConfig()
+} = store
 
 const isExporting = ref(false)
 const activeSection = ref('all')
 const showSidebar = ref(true)
 
-const sections = [
+const sections: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'all', label: '全部' },
   { id: 'colors', label: '色彩系统' },
   { id: 'typography', label: '字体排版' },
@@ -36,41 +40,39 @@ const sections = [
   { id: 'shadows', label: '阴影层级' }
 ]
 
-function handleUpdateConfig(newConfig: any) {
-  updateConfig(newConfig)
-}
-
-function handleToggleCollaboration() {
+function handleToggleCollaboration(): void {
   if (!isCollaborationEnabled.value) {
     initCollaboration()
   }
 }
 
-function handleExport(format: 'css' | 'tailwind' | 'figma' | 'pdf') {
+function handleExport(format: ExportFormat): void {
   isExporting.value = true
   try {
     switch (format) {
       case 'css':
-        exportCSSVariables(config.value)
+        exportCSSVariables(config)
         break
       case 'tailwind':
-        exportTailwindConfig(config.value)
+        exportTailwindConfig(config)
         break
       case 'figma':
-        exportFigmaTokens(config.value)
+        exportFigmaTokens(config)
         break
       case 'pdf':
-        exportPDF('doc-content', `${config.value.name}-design-system.pdf`)
+        void exportPDF('doc-content', `${config.name}-design-system.pdf`)
         break
     }
-  } catch (e) {
-    console.error('Export failed:', e)
+  } catch (err) {
+    console.error('Export failed:', err)
   } finally {
-    setTimeout(() => {
+    window.setTimeout(() => {
       isExporting.value = false
     }, 500)
   }
 }
+
+const totalOnlineCount = computed(() => collaborators.value.length)
 
 const formattedDate = computed(() => {
   return new Date().toLocaleDateString('zh-CN', {
@@ -84,11 +86,7 @@ const formattedDate = computed(() => {
 <template>
   <div class="app-layout">
     <aside v-if="showSidebar" class="sidebar">
-      <ConfigPanel
-        :config="config"
-        @update:config="handleUpdateConfig"
-        @reset="resetConfig"
-      />
+      <ConfigPanel v-model:config="config" @reset="resetConfig" />
     </aside>
 
     <main class="main-content">
@@ -109,9 +107,11 @@ const formattedDate = computed(() => {
 
         <div class="header-right">
           <CollaborationBar
-            :collaborators="collaborators"
-            :current-user-id="userId"
+            :me="me"
+            :others="otherCollaborators"
+            :total-count="totalOnlineCount"
             :is-enabled="isCollaborationEnabled"
+            :is-connected="isConnected"
             @toggle="handleToggleCollaboration"
           />
 
@@ -272,6 +272,7 @@ const formattedDate = computed(() => {
   border-radius: 8px;
   font-size: 0.9rem;
   transition: all 0.2s;
+  cursor: pointer;
 }
 
 .sidebar-toggle:hover {
@@ -321,6 +322,7 @@ const formattedDate = computed(() => {
   font-weight: 500;
   transition: all 0.2s;
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .export-btn:hover:not(:disabled) {
@@ -385,6 +387,7 @@ const formattedDate = computed(() => {
   font-size: 0.85rem;
   color: #334155;
   transition: background 0.15s;
+  cursor: pointer;
 }
 
 .dropdown-menu button:hover {
@@ -414,6 +417,7 @@ const formattedDate = computed(() => {
   font-weight: 500;
   transition: all 0.15s;
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .nav-btn:hover {
@@ -440,7 +444,9 @@ const formattedDate = computed(() => {
   background: white;
   border-radius: 16px;
   padding: 56px 64px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 12px rgba(0, 0, 0, 0.04);
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.04),
+    0 4px 12px rgba(0, 0, 0, 0.04);
 }
 
 .doc-header {

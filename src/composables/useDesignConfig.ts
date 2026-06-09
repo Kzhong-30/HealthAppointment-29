@@ -1,180 +1,576 @@
-import { ref, watch, onMounted } from 'vue'
-import type { DesignSystemConfig, Collaborator } from '../types'
+import type { App, InjectionKey } from 'vue'
+import {
+  ref,
+  reactive,
+  watch,
+  provide,
+  inject,
+  readonly as readonlyWrapper,
+  onUnmounted
+} from 'vue'
+import * as Y from 'yjs'
+import type { YEvent } from 'yjs'
+import { WebrtcProvider } from 'y-webrtc'
+import type {
+  DesignSystemConfig,
+  ColorSystem,
+  ColorSwatch,
+  TypographySystem,
+  SpacingSystem,
+  BorderRadiusSystem,
+  ShadowSystem,
+  Collaborator
+} from '../types'
 import { defaultConfig, collaboratorColors, collaboratorNames } from '../utils/defaults'
 
 const STORAGE_KEY = 'design-system-config'
-const COLLABORATOR_KEY = 'design-system-collaborators'
 const USER_ID_KEY = 'design-system-user-id'
+const ROOM_NAME = 'design-system-collab-room-v1'
+const PUBLIC_SIGNALING = [
+  'wss://signaling.yjs.dev',
+  'wss://y-webrtc-signaling-eu.herokuapp.com'
+]
+const HEARTBEAT_INTERVAL_MS = 30000
+const PRESENCE_TIMEOUT_MS = 180000
+const STORAGE_DEBOUNCE_MS = 300
 
-const config = ref<DesignSystemConfig>({ ...defaultConfig })
-const collaborators = ref<Collaborator[]>([])
-const userId = ref<string>('')
-const isCollaborationEnabled = ref(false)
+type StoreApi = ReturnType<typeof createStore>
 
-let broadcastChannel: BroadcastChannel | null = null
+const INJECT_KEY: InjectionKey<StoreApi> = Symbol(
+  'design-system-store'
+) as InjectionKey<StoreApi>
 
 function generateUserId(): string {
-  return 'user-' + Math.random().toString(36).substring(2, 10)
+  return 'user-' + Math.random().toString(36).slice(2, 10)
 }
 
-function getCurrentUser(): Collaborator {
-  const savedId = localStorage.getItem(USER_ID_KEY)
-  if (savedId) userId.value = savedId
-  else {
-    userId.value = generateUserId()
-    localStorage.setItem(USER_ID_KEY, userId.value)
+function getOrCreateUserId(): string {
+  let id = localStorage.getItem(USER_ID_KEY)
+  if (!id) {
+    id = generateUserId()
+    localStorage.setItem(USER_ID_KEY, id)
   }
-
-  const existingMe = collaborators.value.find(c => c.id === userId.value)
-  if (existingMe) return existingMe
-
-  const usedColors = collaborators.value.map(c => c.color)
-  const availableColors = collaboratorColors.filter(c => !usedColors.includes(c))
-  const usedNames = collaborators.value.map(c => c.name)
-  const availableNames = collaboratorNames.filter(n => !usedNames.includes(n))
-
-  const me: Collaborator = {
-    id: userId.value,
-    name: availableNames[0] || 'User',
-    color: availableColors[0] || '#' + Math.floor(Math.random() * 16777215).toString(16),
-    lastActive: Date.now()
-  }
-  return me
+  return id
 }
 
-function loadFromStorage() {
+function pickCollaboratorIdentity(
+  usedColors: string[],
+  usedNames: string[]
+): { color: string; name: string } {
+  const availableColors = collaboratorColors.filter((c) => !usedColors.includes(c))
+  const availableNames = collaboratorNames.filter((n) => !usedNames.includes(n))
+  return {
+    color:
+      availableColors[0] ??
+      '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'),
+    name: availableNames[0] ?? 'Guest-' + Math.floor(Math.random() * 1000)
+  }
+}
+
+function deepClone<T>(obj: T): T {
+  return JSON.parse(JSON.stringify(obj))
+}
+
+function loadConfigFromStorage(): DesignSystemConfig {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved) {
-      config.value = JSON.parse(saved)
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return deepClone(defaultConfig)
+    const parsed = JSON.parse(raw) as DesignSystemConfig
+    return {
+      name: parsed.name ?? defaultConfig.name,
+      version: parsed.version ?? defaultConfig.version,
+      colors: parsed.colors ?? deepClone(defaultConfig.colors),
+      typography: parsed.typography ?? deepClone(defaultConfig.typography),
+      spacing: parsed.spacing ?? deepClone(defaultConfig.spacing),
+      borderRadius: parsed.borderRadius ?? deepClone(defaultConfig.borderRadius),
+      shadows: parsed.shadows ?? deepClone(defaultConfig.shadows)
     }
-
-    const savedCollabs = localStorage.getItem(COLLABORATOR_KEY)
-    if (savedCollabs) {
-      collaborators.value = JSON.parse(savedCollabs)
-    }
-
-    const me = getCurrentUser()
-    if (!collaborators.value.find(c => c.id === me.id)) {
-      collaborators.value.push(me)
-    }
-    saveCollaborators()
-  } catch (e) {
-    console.error('Failed to load from storage:', e)
+  } catch {
+    return deepClone(defaultConfig)
   }
 }
 
-function saveToStorage() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(config.value))
-}
+type UpdateBasicField = 'name' | 'version'
+type TypographyListField = 'fontSizes' | 'lineHeights'
 
-function saveCollaborators() {
-  localStorage.setItem(COLLABORATOR_KEY, JSON.stringify(collaborators.value))
-}
+function createStore() {
+  const initial = loadConfigFromStorage()
+  const config = reactive<DesignSystemConfig>(initial)
+  const collaborators = ref<Collaborator[]>([])
+  const otherCollaborators = ref<Collaborator[]>([])
+  const me = ref<Collaborator | null>(null)
+  const isCollaborationEnabled = ref(false)
+  const isConnected = ref(false)
 
-function resetConfig() {
-  config.value = JSON.parse(JSON.stringify(defaultConfig))
-  saveToStorage()
-  if (broadcastChannel) {
-    broadcastChannel.postMessage({ type: 'config', data: config.value, userId: userId.value })
-  }
-}
+  let ydoc: Y.Doc | null = null
+  let webrtcProvider: WebrtcProvider | null = null
+  let yConfig: Y.Map<unknown> | null = null
+  let yPresenceMap: Y.Map<unknown> | null = null
+  let isApplyingRemote = false
+  let storageDebounceTimer: number | null = null
+  let heartbeatTimer: number | null = null
+  let presenceCleanupTimer: number | null = null
+  let referenceCounter = 0
+  const teardownFns: Array<() => void> = []
 
-function updateConfig(newConfig: Partial<DesignSystemConfig>) {
-  config.value = { ...config.value, ...newConfig }
-}
-
-function initCollaboration() {
-  if (isCollaborationEnabled.value) return
-
-  try {
-    broadcastChannel = new BroadcastChannel('design-system-collab')
-
-    broadcastChannel.onmessage = (event) => {
-      const { type, data, userId: senderId } = event.data
-
-      if (senderId === userId.value) return
-
-      if (type === 'config') {
-        config.value = data
-        saveToStorage()
-      } else if (type === 'presence') {
-        const existing = collaborators.value.find(c => c.id === data.id)
-        if (existing) {
-          existing.lastActive = Date.now()
-        } else {
-          collaborators.value.push(data)
-        }
-        saveCollaborators()
-      } else if (type === 'leave') {
-        collaborators.value = collaborators.value.filter(c => c.id !== data.id)
-        saveCollaborators()
-      }
+  function saveConfigToStorage(): void {
+    if (storageDebounceTimer !== null) {
+      window.clearTimeout(storageDebounceTimer)
     }
-
-    isCollaborationEnabled.value = true
-
-    const me = getCurrentUser()
-    broadcastChannel.postMessage({ type: 'presence', data: me, userId: userId.value })
-
-    setInterval(() => {
-      if (broadcastChannel && userId.value) {
-        const me = collaborators.value.find(c => c.id === userId.value)
-        if (me) {
-          me.lastActive = Date.now()
-          broadcastChannel.postMessage({ type: 'presence', data: me, userId: userId.value })
-        }
+    storageDebounceTimer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
+      } catch (err) {
+        console.error('[DesignSystem] save failed:', err)
       }
-    }, 10000)
+    }, STORAGE_DEBOUNCE_MS)
+  }
 
-    setInterval(() => {
-      const now = Date.now()
-      const beforeCount = collaborators.value.length
-      collaborators.value = collaborators.value.filter(
-        c => c.id === userId.value || now - c.lastActive < 60000
+  function pushToRemote(): void {
+    if (!yConfig || isApplyingRemote) return
+    yConfig.set('payload', JSON.stringify(config))
+  }
+
+  function updateMeTimestamp(): void {
+    if (!me.value) return
+    me.value.lastActive = Date.now()
+    if (yPresenceMap && me.value) {
+      yPresenceMap.set(me.value.id, JSON.stringify(me.value))
+    }
+  }
+
+  function refreshOtherCollaborators(): void {
+    const myId = me.value?.id
+    otherCollaborators.value = myId
+      ? collaborators.value.filter((c) => c.id !== myId)
+      : collaborators.value.slice()
+  }
+
+  function initializeMe(): void {
+    const myId = getOrCreateUserId()
+    const existing = collaborators.value.find((c) => c.id === myId)
+    if (existing) {
+      me.value = existing
+      existing.lastActive = Date.now()
+    } else {
+      const identity = pickCollaboratorIdentity(
+        collaborators.value.map((c) => c.color),
+        collaborators.value.map((c) => c.name)
       )
-      if (collaborators.value.length !== beforeCount) {
-        saveCollaborators()
+      const meData: Collaborator = {
+        id: myId,
+        name: identity.name,
+        color: identity.color,
+        lastActive: Date.now()
       }
-    }, 15000)
+      collaborators.value.push(meData)
+      me.value = meData
+    }
+    refreshOtherCollaborators()
+  }
 
-    window.addEventListener('beforeunload', () => {
-      if (broadcastChannel && userId.value) {
-        const me = collaborators.value.find(c => c.id === userId.value)
-        if (me) {
-          broadcastChannel.postMessage({ type: 'leave', data: me, userId: userId.value })
+  function applyRemote(raw: unknown): void {
+    if (!raw) return
+    try {
+      const remote = JSON.parse(String(raw)) as Partial<DesignSystemConfig>
+      isApplyingRemote = true
+      if (typeof remote.name === 'string') config.name = remote.name
+      if (typeof remote.version === 'string') config.version = remote.version
+      if (remote.colors) {
+        const cs = remote.colors as ColorSystem
+        if (Array.isArray(cs.primary)) {
+          config.colors.primary = cs.primary.map((s) => ({ name: s.name, value: s.value }))
+        }
+        if (Array.isArray(cs.secondary)) {
+          config.colors.secondary = cs.secondary.map((s) => ({ name: s.name, value: s.value }))
+        }
+        if (Array.isArray(cs.neutral)) {
+          config.colors.neutral = cs.neutral.map((s) => ({ name: s.name, value: s.value }))
         }
       }
-    })
-  } catch (e) {
-    console.error('Failed to initialize collaboration:', e)
-  }
-}
-
-export function useDesignConfig() {
-  onMounted(() => {
-    loadFromStorage()
-  })
-
-  watch(
-    config,
-    () => {
-      saveToStorage()
-      if (broadcastChannel) {
-        broadcastChannel.postMessage({ type: 'config', data: config.value, userId: userId.value })
+      if (remote.typography) {
+        const t = remote.typography as TypographySystem
+        if (typeof t.fontFamily === 'string') config.typography.fontFamily = t.fontFamily
+        if (Array.isArray(t.fontSizes)) {
+          config.typography.fontSizes = t.fontSizes.map((f) => ({ name: f.name, value: f.value }))
+        }
+        if (Array.isArray(t.lineHeights)) {
+          config.typography.lineHeights = t.lineHeights.map((l) => ({
+            name: l.name,
+            value: typeof l.value === 'number' ? l.value : Number(l.value)
+          }))
+        }
       }
+      if (remote.spacing) {
+        const sp = remote.spacing as SpacingSystem
+        config.spacing = Object.keys(sp).reduce<SpacingSystem>((acc, k) => {
+          if (typeof sp[k] === 'string') acc[k] = sp[k]
+          return acc
+        }, {})
+      }
+      if (remote.borderRadius) {
+        const br = remote.borderRadius as BorderRadiusSystem
+        config.borderRadius = Object.keys(br).reduce<BorderRadiusSystem>((acc, k) => {
+          if (typeof br[k] === 'string') acc[k] = br[k]
+          return acc
+        }, {})
+      }
+      if (remote.shadows) {
+        const sh = remote.shadows as ShadowSystem
+        if (Array.isArray(sh.levels)) {
+          config.shadows.levels = sh.levels.map((l) => ({ name: l.name, value: l.value }))
+        }
+      }
+    } catch (err) {
+      console.error('[DesignSystem] remote apply error:', err)
+    } finally {
+      window.setTimeout(() => {
+        isApplyingRemote = false
+      }, 0)
+    }
+  }
+
+  function rebuildPresenceFromYjs(): void {
+    if (!yPresenceMap) return
+    const rawList: unknown[] = yPresenceMap.toJSON() as unknown[]
+    const parsed: Collaborator[] = []
+    for (const raw of Object.values(rawList)) {
+      try {
+        const c = JSON.parse(String(raw)) as Collaborator
+        if (c && c.id && typeof c.id === 'string') {
+          parsed.push(c)
+        }
+      } catch {
+        // skip malformed entries
+      }
+    }
+    collaborators.value = parsed
+    if (me.value) {
+      const currentMe = parsed.find((c) => c.id === me.value!.id)
+      if (currentMe) me.value = currentMe
+    }
+    refreshOtherCollaborators()
+  }
+
+  function cleanupStalePresence(): void {
+    const now = Date.now()
+    const myId = me.value?.id
+    const before = collaborators.value.length
+    collaborators.value = collaborators.value.filter((c) => {
+      if (c.id === myId) return true
+      return now - c.lastActive < PRESENCE_TIMEOUT_MS
+    })
+    if (collaborators.value.length !== before) {
+      refreshOtherCollaborators()
+    }
+  }
+
+  function initCollaboration(): void {
+    if (isCollaborationEnabled.value) return
+    try {
+      ydoc = new Y.Doc()
+      yConfig = ydoc.getMap('config')
+      yPresenceMap = ydoc.getMap('presence')
+
+      webrtcProvider = new WebrtcProvider(ROOM_NAME, ydoc, {
+        signaling: PUBLIC_SIGNALING
+      })
+
+      if (!me.value) initializeMe()
+      updateMeTimestamp()
+
+      const firstRemote = yConfig.get('payload')
+      if (firstRemote) {
+        applyRemote(firstRemote)
+      } else {
+        pushToRemote()
+      }
+      if (yPresenceMap && me.value) {
+        yPresenceMap.set(me.value.id, JSON.stringify(me.value))
+      }
+
+      const onRemoteConfig = (events: YEvent<Y.AbstractType<unknown>>[]): void => {
+        for (const ev of events) {
+          const target = ev.target as Y.Map<unknown>
+          if (target === yConfig && ev.changes.keys.has('payload')) {
+            const payload = target.get('payload')
+            applyRemote(payload)
+          }
+          if (target === yPresenceMap) {
+            rebuildPresenceFromYjs()
+          }
+        }
+      }
+      yConfig.observeDeep(onRemoteConfig)
+      yPresenceMap.observeDeep(onRemoteConfig)
+
+      const onProviderStatus = ({ connected }: { connected: boolean }): void => {
+        isConnected.value = connected
+      }
+      webrtcProvider.on('status', onProviderStatus)
+
+      const onProviderSynced = (): void => {
+        const latest = yConfig?.get('payload')
+        if (latest) applyRemote(latest)
+        else pushToRemote()
+      }
+      webrtcProvider.on('synced', onProviderSynced)
+
+      heartbeatTimer = window.setInterval(() => {
+        updateMeTimestamp()
+      }, HEARTBEAT_INTERVAL_MS)
+
+      presenceCleanupTimer = window.setInterval(() => {
+        cleanupStalePresence()
+      }, HEARTBEAT_INTERVAL_MS * 2)
+
+      isCollaborationEnabled.value = true
+
+      teardownFns.push(() => {
+        if (heartbeatTimer !== null) {
+          window.clearInterval(heartbeatTimer)
+          heartbeatTimer = null
+        }
+        if (presenceCleanupTimer !== null) {
+          window.clearInterval(presenceCleanupTimer)
+          presenceCleanupTimer = null
+        }
+        if (webrtcProvider) {
+          webrtcProvider.off('status', onProviderStatus)
+          webrtcProvider.off('synced', onProviderSynced)
+          if (yPresenceMap && me.value) {
+            yPresenceMap.delete(me.value.id)
+          }
+          webrtcProvider.destroy()
+          webrtcProvider = null
+        }
+        if (ydoc) {
+          ydoc.destroy()
+          ydoc = null
+        }
+        yConfig = null
+        yPresenceMap = null
+        isCollaborationEnabled.value = false
+        isConnected.value = false
+      })
+    } catch (err) {
+      console.error('[DesignSystem] collaboration init failed:', err)
+      isCollaborationEnabled.value = false
+    }
+  }
+
+  function replaceConfig(next: DesignSystemConfig): void {
+    Object.assign(config, deepClone(next))
+  }
+
+  function resetConfig(): void {
+    const restored = deepClone(defaultConfig)
+    replaceConfig(restored)
+  }
+
+  function updateBasic(field: UpdateBasicField, value: string): void {
+    config[field] = value
+  }
+
+  function updateColorCategory(
+    category: 'primary' | 'secondary' | 'neutral',
+    index: number,
+    value: string
+  ): void {
+    const target = config.colors[category]
+    if (!target[index]) return
+    target[index].value = value
+  }
+
+  function addColorSwatch(category: 'primary' | 'secondary' | 'neutral'): void {
+    const target = config.colors[category]
+    const last = target[target.length - 1]
+    const nextName = last
+      ? String((Number.parseInt(last.name, 10) || 0) + 100)
+      : '50'
+    const next: ColorSwatch = { name: nextName, value: '#cccccc' }
+    target.push(next)
+  }
+
+  function removeColorSwatch(
+    category: 'primary' | 'secondary' | 'neutral',
+    index: number
+  ): void {
+    const target = config.colors[category]
+    if (index < 0 || index >= target.length) return
+    target.splice(index, 1)
+  }
+
+  function updateFontFamily(value: string): void {
+    config.typography.fontFamily = value
+  }
+
+  function updateFontSize(
+    index: number,
+    field: 'name' | 'value',
+    value: string
+  ): void {
+    const target = config.typography.fontSizes[index]
+    if (!target) return
+    target[field] = value
+  }
+
+  function updateLineHeight(
+    index: number,
+    field: 'name' | 'value',
+    value: string | number
+  ): void {
+    const target = config.typography.lineHeights[index]
+    if (!target) return
+    if (field === 'value') {
+      target.value = Number(value) || target.value
+    } else {
+      target.name = String(value)
+    }
+  }
+
+  function updateSpacing(key: string, value: string): void {
+    config.spacing[key] = value
+  }
+
+  function addSpacing(): void {
+    const existingKeys = Object.keys(config.spacing)
+      .map((k) => Number.parseInt(k, 10))
+      .filter((n) => Number.isFinite(n))
+    const max = existingKeys.length ? Math.max(...existingKeys) : 0
+    config.spacing[String(max + 1)] = '0px'
+  }
+
+  function removeSpacing(key: string): void {
+    delete config.spacing[key]
+  }
+
+  function updateBorderRadius(key: string, value: string): void {
+    config.borderRadius[key] = value
+  }
+
+  function updateShadow(
+    index: number,
+    field: 'name' | 'value',
+    value: string
+  ): void {
+    const target = config.shadows.levels[index]
+    if (!target) return
+    target[field] = value
+  }
+
+  function addShadow(): void {
+    config.shadows.levels.push({
+      name: 'new-level',
+      value: '0 0 0 rgba(0,0,0,0)'
+    })
+  }
+
+  function removeShadow(index: number): void {
+    if (index < 0 || index >= config.shadows.levels.length) return
+    config.shadows.levels.splice(index, 1)
+  }
+
+  const stopWatching = watch(
+    () => deepClone(config),
+    () => {
+      saveConfigToStorage()
+      pushToRemote()
     },
     { deep: true }
   )
+  teardownFns.push(() => {
+    stopWatching()
+    if (storageDebounceTimer !== null) {
+      window.clearTimeout(storageDebounceTimer)
+      storageDebounceTimer = null
+    }
+  })
+
+  initializeMe()
+
+  function dispose(): void {
+    referenceCounter -= 1
+    if (referenceCounter <= 0) {
+      referenceCounter = 0
+      let fn: (() => void) | undefined
+      while ((fn = teardownFns.pop())) {
+        try {
+          fn()
+        } catch (err) {
+          console.error('[DesignSystem] teardown failed:', err)
+        }
+      }
+    }
+  }
+
+  referenceCounter += 1
 
   return {
     config,
-    collaborators,
-    userId,
-    isCollaborationEnabled,
-    resetConfig,
-    updateConfig,
+    collaborators: readonlyWrapper(collaborators),
+    otherCollaborators: readonlyWrapper(otherCollaborators),
+    me,
+    isCollaborationEnabled: readonlyWrapper(isCollaborationEnabled),
+    isConnected: readonlyWrapper(isConnected),
     initCollaboration,
-    saveToStorage
+    resetConfig,
+    replaceConfig,
+    updateBasic,
+    updateColorCategory,
+    addColorSwatch,
+    removeColorSwatch,
+    updateFontFamily,
+    updateFontSize,
+    updateLineHeight,
+    updateSpacing,
+    addSpacing,
+    removeSpacing,
+    updateBorderRadius,
+    updateShadow,
+    addShadow,
+    removeShadow,
+    dispose
   }
 }
+
+let singletonStore: StoreApi | null = null
+
+export function getOrCreateSingletonStore(): StoreApi {
+  if (!singletonStore) {
+    singletonStore = createStore()
+  }
+  return singletonStore
+}
+
+export function bootstrapDesignStore(app: App<Element>): void {
+  const store = getOrCreateSingletonStore()
+  app.provide(INJECT_KEY, store)
+}
+
+export function provideDesignStore(): void {
+  provide(INJECT_KEY, getOrCreateSingletonStore())
+}
+
+export function useDesignConfig(): StoreApi {
+  const store = inject<StoreApi>(INJECT_KEY)
+  if (!store) {
+    if (!singletonStore) {
+      singletonStore = createStore()
+    }
+    return singletonStore
+  }
+  return store
+}
+
+export function useScopedDesignConfig(): StoreApi {
+  const store = useDesignConfig()
+  onUnmounted(() => {
+    store.dispose()
+  })
+  return store
+}
+
+export type DesignStoreApi = StoreApi
+
+export const TypographyListFields: TypographyListField[] = ['fontSizes', 'lineHeights']

@@ -2,9 +2,11 @@
 import type { Collaborator } from '../types'
 
 defineProps<{
-  collaborators: Collaborator[]
-  currentUserId: string
+  me: Collaborator | null
+  others: readonly Collaborator[]
+  totalCount: number
   isEnabled: boolean
+  isConnected: boolean
 }>()
 
 const emit = defineEmits<{
@@ -16,25 +18,47 @@ const emit = defineEmits<{
   <div class="collab-bar">
     <button
       class="collab-toggle"
-      :class="{ active: isEnabled }"
+      :class="{ active: isEnabled, connected: isConnected && isEnabled }"
       @click="emit('toggle')"
+      :title="
+        isEnabled
+          ? isConnected
+            ? '已连接到协作房间'
+            : '正在连接协作房间…'
+          : '开启跨设备实时协作'
+      "
     >
-      <span class="toggle-icon">{{ isEnabled ? '🟢' : '⚪' }}</span>
-      <span class="toggle-text">{{ isEnabled ? '协作已开启' : '开启协作' }}</span>
+      <span class="status-dot"></span>
+      <span class="toggle-icon">
+        {{ isEnabled ? (isConnected ? '🟢' : '🟡') : '⚪' }}
+      </span>
+      <span class="toggle-text">
+        {{ isEnabled ? (isConnected ? '协作已连接' : '连接中…') : '开启协作' }}
+      </span>
     </button>
 
-    <div v-if="collaborators.length > 0" class="avatars-stack">
-      <div
-        v-for="collab in collaborators.slice().reverse()"
-        :key="collab.id"
-        class="avatar"
-        :style="{ backgroundColor: collab.color }"
-        :title="collab.name + (collab.id === currentUserId ? ' (你)' : '')"
-      >
-        {{ collab.name.charAt(0).toUpperCase() }}
-      </div>
-      <span v-if="collaborators.length > 1" class="collab-count">
-        {{ collaborators.length }} 人在线
+    <div v-if="me || others.length > 0" class="avatars-stack">
+      <template v-if="me">
+        <div
+          class="avatar me-avatar"
+          :style="{ backgroundColor: me.color }"
+          :title="me.name + ' (你)'"
+        >
+          {{ me.name.charAt(0).toUpperCase() }}
+          <span class="me-badge">你</span>
+        </div>
+      </template>
+      <template v-for="collab in others" :key="collab.id">
+        <div
+          class="avatar other-avatar"
+          :style="{ backgroundColor: collab.color }"
+          :title="collab.name"
+        >
+          {{ collab.name.charAt(0).toUpperCase() }}
+        </div>
+      </template>
+      <span v-if="totalCount > 0" class="collab-count">
+        {{ totalCount }} 人在线
       </span>
     </div>
   </div>
@@ -48,6 +72,7 @@ const emit = defineEmits<{
 }
 
 .collab-toggle {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -58,9 +83,10 @@ const emit = defineEmits<{
   transition: all 0.2s;
   font-size: 0.85rem;
   font-weight: 500;
+  cursor: pointer;
 }
 
-.collab-toggle:hover {
+.collab-toggle:hover:not(:disabled) {
   border-color: #3b82f6;
   background: #eff6ff;
 }
@@ -69,6 +95,22 @@ const emit = defineEmits<{
   border-color: #22c55e;
   background: #f0fdf4;
   color: #15803d;
+}
+
+.collab-toggle.connected::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 3px #f0fdf4;
+}
+
+.status-dot {
+  display: none;
 }
 
 .toggle-icon {
@@ -86,6 +128,7 @@ const emit = defineEmits<{
 }
 
 .avatar {
+  position: relative;
   width: 32px;
   height: 32px;
   border-radius: 50%;
@@ -107,6 +150,31 @@ const emit = defineEmits<{
 .avatar:hover {
   transform: scale(1.1);
   z-index: 10;
+}
+
+.me-avatar {
+  border: 2px solid #3b82f6;
+  box-shadow: 0 0 0 2px #dbeafe;
+  z-index: 5;
+}
+
+.me-badge {
+  position: absolute;
+  bottom: -4px;
+  right: -6px;
+  font-size: 0.6rem;
+  line-height: 1;
+  padding: 2px 5px;
+  background: #3b82f6;
+  color: white;
+  border-radius: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.other-avatar {
+  opacity: 0.92;
 }
 
 .collab-count {

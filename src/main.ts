@@ -1,5 +1,8 @@
 import { createApp } from 'vue'
 import './styles/global.css'
 import App from './App.vue'
+import { bootstrapDesignStore } from './composables/useDesignConfig'
 
-createApp(App).mount('#app')
+const app = createApp(App)
+bootstrapDesignStore(app)
+app.mount('#app')
