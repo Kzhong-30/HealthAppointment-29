@@ -24,6 +24,7 @@ const {
   collaborators,
   isCollaborationEnabled,
   isConnected,
+  collabMode,
   resetConfig,
   initCollaboration
 } = store
@@ -112,6 +113,7 @@ const formattedDate = computed(() => {
             :total-count="totalOnlineCount"
             :is-enabled="isCollaborationEnabled"
             :is-connected="isConnected"
+            :collab-mode="collabMode"
             @toggle="handleToggleCollaboration"
           />
 

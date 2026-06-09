@@ -13,7 +13,7 @@
   - 🎨 **CSS 变量文件** — `:root { --color-primary-500: ... }`
   - ⚡ **Tailwind 配置扩展** — `tailwind.config.extended.js`
   - 🎯 **Figma Tokens JSON** — Token Studio 兼容格式
-- 👥 **多人实时协作**：基于 **Yjs CRDT + WebRTC**，跨设备、跨浏览器、无需自建后端
+- 👥 **多人实时协作**：基于 **Yjs CRDT**，支持两种协作模式，真正跨设备 / 跨浏览器同步
 - 💾 **本地持久化**：所有配置自动保存至 `localStorage`，刷新不丢失
 - 🔒 **完全类型安全**：零 `any`，严格的 TypeScript 类型定义
 
@@ -53,23 +53,69 @@ npm run typecheck
 
 ## 👥 多人协作
 
-本工具采用 **Yjs CRDT + y-webrtc** 实现真正的 P2P 跨设备协作，无需任何自建后端。
+本工具采用 **Yjs CRDT** 实现真正跨设备多人实时协作，提供两种网络模式：
 
-### 使用步骤
+| 模式 | 协议 | 适用场景 | 数据路径 | 标签 |
+| --- | --- | --- | --- | --- |
+| **WebRTC P2P** | 点对点 | 同一局域网 / 同一 Wi-Fi / 非严格 NAT | 浏览器↔浏览器（直连） | `P2P`（紫色标签） |
+| **WebSocket 中转** | 客户端-服务器 | 严格 NAT / 企业内网 / 跨办公区 | 浏览器→服务器→浏览器（中转） | `WS`（青色标签） |
+
+### 使用步骤（快速上手，默认 WebRTC + 公共信令）
 
 1. 团队中任意一人点击顶栏的 **「开启协作」** 按钮
 2. 其他成员使用**相同的 URL** 在各自设备上打开页面，同样点击 **「开启协作」**
-3. 连接成功后，按钮会显示 **「协作已连接」**，右上角会出现协作者头像
+3. 连接成功后，按钮会显示 **「协作已连接」**，右上角会出现协作者头像（我有蓝框 + 「你」徽标）
 4. 此后任何成员对设计参数的修改都会**毫秒级同步**到所有人的界面
 
-### 技术细节
+### 模式一：WebRTC P2P（推荐同网络）
 
-- 使用公共的 signaling server（`wss://signaling.yjs.dev`）做 WebRTC 握手，数据直接在浏览器之间 P2P 传输，**不经过任何中间服务器**
-- 基于 CRDT 算法保证最终一致性，网络波动时的离线编辑也会在恢复后自动合并
+**启动方式（默认即使用公共 signaling，无需任何额外服务）：**
+
+```bash
+npm run dev                # 公共 yjs.dev 信令，同 Wi-Fi 下稳定直连
+
+# 或：使用本地自建 signaling server（推荐企业内部分发）
+# 终端 1：启动本地 signaling（端口 4444）
+npm run signaling
+# 终端 2：使用本地 signaling 启动前端
+npm run dev:webrtc
+```
+
+**技术细节：**
+- 使用公共 signaling server（`wss://signaling.yjs.dev`）做 WebRTC 握手，数据直接 P2P 直连，**不经过任何中间服务器**
+- 自建 signaling 时运行 `scripts/signaling-server.js`（约 30 行 Node.js，仅做房间内 WebSocket 消息转发，零持久化）
+- 基于 CRDT 算法保证最终一致性，网络波动时离线编辑会在恢复后自动合并
 - 协作者超时时间 3 分钟，心跳 30 秒
-- 协作房间号默认固定为 `design-system-collab-room-v1`，同一房间内的成员彼此可见
 
-> 💡 **提示**：如果跨网络无法直连（如严格 NAT 环境），建议团队成员连入同一 Wi-Fi 或使用 VPN。
+> 💡 **WebRTC NAT 提示**：如果成员处于不同运营商网络或企业严格 NAT，点对点连接可能失败。此时建议切换到 WebSocket 中转模式。
+
+### 模式二：WebSocket 中转（推荐严格 NAT / 企业内网）
+
+**启动方式（需一台内网可达的机器跑 y-websocket 服务）：**
+
+```bash
+# 终端 1：启动 WebSocket 服务器（端口 1234，全量同步 CRDT 数据）
+npm run websocket-server
+
+# 终端 2：使用 WebSocket 模式启动前端
+npm run dev:ws
+```
+
+**部署到企业内网：**
+- 将 `y-websocket` 服务部署到任意内网 Node 服务器，端口 1234
+- 前端打包时传入环境变量：
+  ```bash
+  VITE_COLLAB_MODE=websocket \
+  VITE_WEBSOCKET_URL=ws://your-internal-host:1234 \
+  npm run build
+  ```
+- 所有成员访问部署好的前端站点，彼此通过内网 WebSocket 实时同步
+
+### 两种模式的切换方式
+
+- **开发期**：通过 `npm run dev` / `dev:ws` / `dev:webrtc` 三个脚本区分
+- **生产期**：通过构建时注入 `VITE_COLLAB_MODE` 和对应的服务器 URL 环境变量
+- **UI 反馈**：协作按钮旁会显示 `P2P` 或 `WS` 小标签，悬停可查看当前模式说明
 
 ---
 

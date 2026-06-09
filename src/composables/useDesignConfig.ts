@@ -11,6 +11,7 @@ import {
 import * as Y from 'yjs'
 import type { YEvent } from 'yjs'
 import { WebrtcProvider } from 'y-webrtc'
+import { WebsocketProvider } from 'y-websocket'
 import type {
   DesignSystemConfig,
   ColorSystem,
@@ -23,6 +24,8 @@ import type {
 } from '../types'
 import { defaultConfig, collaboratorColors, collaboratorNames } from '../utils/defaults'
 
+type CollabMode = 'webrtc' | 'websocket'
+
 const STORAGE_KEY = 'design-system-config'
 const USER_ID_KEY = 'design-system-user-id'
 const ROOM_NAME = 'design-system-collab-room-v1'
@@ -30,6 +33,45 @@ const PUBLIC_SIGNALING = [
   'wss://signaling.yjs.dev',
   'wss://y-webrtc-signaling-eu.herokuapp.com'
 ]
+
+type CollabEnvKey = 'VITE_COLLAB_MODE' | 'VITE_WEBSOCKET_URL' | 'VITE_SIGNALING_URLS'
+
+interface CollabEnvResult {
+  VITE_COLLAB_MODE: unknown
+  VITE_WEBSOCKET_URL: unknown
+  VITE_SIGNALING_URLS: unknown
+}
+
+function readEnvValue<K extends CollabEnvKey>(
+  key: K,
+  env: ImportMetaEnv
+): CollabEnvResult[K] | undefined {
+  const record: Record<string, unknown> = env
+  const value = record[key]
+  if (value === undefined || value === null) return undefined
+  return value
+}
+
+function readEnvString<K extends CollabEnvKey>(key: K, env: ImportMetaEnv): string | undefined {
+  const raw = readEnvValue(key, env)
+  return typeof raw === 'string' ? raw : undefined
+}
+
+const rawMode = readEnvValue('VITE_COLLAB_MODE', import.meta.env)
+const COLLAB_MODE: CollabMode = rawMode === 'websocket' ? 'websocket' : 'webrtc'
+
+const rawWs = readEnvString('VITE_WEBSOCKET_URL', import.meta.env)
+const WEBSOCKET_URL: string = rawWs && rawWs.length > 0 ? rawWs : 'ws://localhost:1234'
+
+const rawSig = readEnvString('VITE_SIGNALING_URLS', import.meta.env)
+const SIGNALING_URLS: string[] =
+  rawSig && rawSig.length > 0
+    ? rawSig
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : PUBLIC_SIGNALING
+
 const HEARTBEAT_INTERVAL_MS = 30000
 const PRESENCE_TIMEOUT_MS = 180000
 const STORAGE_DEBOUNCE_MS = 300
@@ -39,6 +81,153 @@ type StoreApi = ReturnType<typeof createStore>
 const INJECT_KEY: InjectionKey<StoreApi> = Symbol(
   'design-system-store'
 ) as InjectionKey<StoreApi>
+
+type UnifiedStatusHandler = (p: { connected: boolean }) => void
+type UnifiedSyncedHandler = () => void
+
+type WebrtcStatusPayload = { connected: boolean }
+type WebsocketStatusPayload = { status: 'connected' | 'connecting' | 'disconnected' }
+
+interface ProviderCommon {
+  destroy(): void
+}
+
+interface ProviderLike {
+  on?: unknown
+  off?: unknown
+  destroy?: unknown
+  wsconnected?: unknown
+}
+
+type WrappedHandler = (...args: unknown[]) => void
+
+interface WrappedHandlers {
+  status: WrappedHandler | null
+  synced: WrappedHandler | null
+}
+
+const attachedHandlers = new WeakMap<object, Map<object, WrappedHandlers>>()
+
+function isWebsocketProvider(
+  p: WebrtcProvider | WebsocketProvider | null
+): p is WebsocketProvider {
+  if (p === null) return false
+  return typeof (p as ProviderLike).wsconnected !== 'undefined'
+}
+
+function hasCommonOps<T extends ProviderLike>(
+  obj: T | null
+): obj is T & ProviderCommon {
+  if (obj === null) return false
+  return typeof obj.destroy === 'function'
+}
+
+function normalizeStatus(
+  provider: WebrtcProvider | WebsocketProvider | null,
+  payload: WebrtcStatusPayload | WebsocketStatusPayload
+): { connected: boolean } {
+  if (isWebsocketProvider(provider)) {
+    const p = payload as WebsocketStatusPayload
+    return { connected: p.status === 'connected' }
+  }
+  const p = payload as WebrtcStatusPayload
+  return { connected: typeof p.connected === 'boolean' ? p.connected : false }
+}
+
+function ensureProviderMap(
+  providerObj: WebrtcProvider | WebsocketProvider
+): Map<object, WrappedHandlers> {
+  let pmap = attachedHandlers.get(providerObj)
+  if (!pmap) {
+    pmap = new Map()
+    attachedHandlers.set(providerObj, pmap)
+  }
+  return pmap
+}
+
+function callProviderOn(
+  provider: WebrtcProvider | WebsocketProvider,
+  name: string,
+  fn: WrappedHandler
+): void {
+  const p = provider as ProviderLike
+  if (typeof p.on === 'function') {
+    ;(p.on as (n: string, f: WrappedHandler) => void)(name, fn)
+  }
+}
+
+function callProviderOff(
+  provider: WebrtcProvider | WebsocketProvider,
+  name: string,
+  fn: WrappedHandler
+): void {
+  const p = provider as ProviderLike
+  if (typeof p.off === 'function') {
+    ;(p.off as (n: string, f: WrappedHandler) => void)(name, fn)
+  }
+}
+
+function attachProviderStatus(
+  provider: WebrtcProvider | WebsocketProvider | null,
+  handler: UnifiedStatusHandler
+): void {
+  if (!provider) return
+  const pmap = ensureProviderMap(provider)
+  const key: object = handler
+  const existing = pmap.get(key)
+  const wrappedStatus: WrappedHandler = (payload: unknown) => {
+    const p = payload as WebrtcStatusPayload | WebsocketStatusPayload
+    handler(normalizeStatus(provider, p))
+  }
+  pmap.set(key, {
+    status: wrappedStatus,
+    synced: existing?.synced ?? null
+  })
+  callProviderOn(provider, 'status', wrappedStatus)
+}
+
+function attachProviderSynced(
+  provider: WebrtcProvider | WebsocketProvider | null,
+  handler: UnifiedSyncedHandler
+): void {
+  if (!provider) return
+  const pmap = ensureProviderMap(provider)
+  const key: object = handler
+  const existing = pmap.get(key)
+  const wrappedSynced: WrappedHandler = () => {
+    handler()
+  }
+  pmap.set(key, {
+    status: existing?.status ?? null,
+    synced: wrappedSynced
+  })
+  callProviderOn(provider, 'synced', wrappedSynced)
+}
+
+function detachProviderHandlers(
+  provider: WebrtcProvider | WebsocketProvider | null,
+  statusHandler: UnifiedStatusHandler,
+  syncedHandler: UnifiedSyncedHandler
+): void {
+  if (!provider) return
+  const pmap = attachedHandlers.get(provider)
+  if (!pmap) return
+  const statusEntry = pmap.get(statusHandler as object)
+  if (statusEntry?.status) {
+    callProviderOff(provider, 'status', statusEntry.status)
+  }
+  const syncedEntry = pmap.get(syncedHandler as object)
+  if (syncedEntry?.synced) {
+    callProviderOff(provider, 'synced', syncedEntry.synced)
+  }
+  pmap.delete(statusHandler as object)
+  pmap.delete(syncedHandler as object)
+}
+
+function destroyProvider(provider: WebrtcProvider | WebsocketProvider | null): void {
+  if (!hasCommonOps(provider)) return
+  provider.destroy()
+}
 
 function generateUserId(): string {
   return 'user-' + Math.random().toString(36).slice(2, 10)
@@ -101,9 +290,10 @@ function createStore() {
   const me = ref<Collaborator | null>(null)
   const isCollaborationEnabled = ref(false)
   const isConnected = ref(false)
+  const collabMode = ref<CollabMode>(COLLAB_MODE)
 
   let ydoc: Y.Doc | null = null
-  let webrtcProvider: WebrtcProvider | null = null
+  let provider: WebrtcProvider | WebsocketProvider | null = null
   let yConfig: Y.Map<unknown> | null = null
   let yPresenceMap: Y.Map<unknown> | null = null
   let isApplyingRemote = false
@@ -272,9 +462,12 @@ function createStore() {
       yConfig = ydoc.getMap('config')
       yPresenceMap = ydoc.getMap('presence')
 
-      webrtcProvider = new WebrtcProvider(ROOM_NAME, ydoc, {
-        signaling: PUBLIC_SIGNALING
-      })
+      collabMode.value = COLLAB_MODE
+      if (COLLAB_MODE === 'websocket') {
+        provider = new WebsocketProvider(WEBSOCKET_URL, ROOM_NAME, ydoc, { connect: true })
+      } else {
+        provider = new WebrtcProvider(ROOM_NAME, ydoc, { signaling: SIGNALING_URLS })
+      }
 
       if (!me.value) initializeMe()
       updateMeTimestamp()
@@ -304,17 +497,17 @@ function createStore() {
       yConfig.observeDeep(onRemoteConfig)
       yPresenceMap.observeDeep(onRemoteConfig)
 
-      const onProviderStatus = ({ connected }: { connected: boolean }): void => {
+      const onProviderStatus: UnifiedStatusHandler = ({ connected }): void => {
         isConnected.value = connected
       }
-      webrtcProvider.on('status', onProviderStatus)
+      attachProviderStatus(provider, onProviderStatus)
 
-      const onProviderSynced = (): void => {
+      const onProviderSynced: UnifiedSyncedHandler = (): void => {
         const latest = yConfig?.get('payload')
         if (latest) applyRemote(latest)
         else pushToRemote()
       }
-      webrtcProvider.on('synced', onProviderSynced)
+      attachProviderSynced(provider, onProviderSynced)
 
       heartbeatTimer = window.setInterval(() => {
         updateMeTimestamp()
@@ -335,14 +528,13 @@ function createStore() {
           window.clearInterval(presenceCleanupTimer)
           presenceCleanupTimer = null
         }
-        if (webrtcProvider) {
-          webrtcProvider.off('status', onProviderStatus)
-          webrtcProvider.off('synced', onProviderSynced)
+        if (provider) {
+          detachProviderHandlers(provider, onProviderStatus, onProviderSynced)
           if (yPresenceMap && me.value) {
             yPresenceMap.delete(me.value.id)
           }
-          webrtcProvider.destroy()
-          webrtcProvider = null
+          destroyProvider(provider)
+          provider = null
         }
         if (ydoc) {
           ydoc.destroy()
@@ -511,8 +703,9 @@ function createStore() {
     collaborators: readonlyWrapper(collaborators),
     otherCollaborators: readonlyWrapper(otherCollaborators),
     me,
-    isCollaborationEnabled: readonlyWrapper(isCollaborationEnabled),
-    isConnected: readonlyWrapper(isConnected),
+    isCollaborationEnabled,
+    isConnected,
+    collabMode,
     initCollaboration,
     resetConfig,
     replaceConfig,

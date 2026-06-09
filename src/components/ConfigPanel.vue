@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DesignSystemConfig, ColorSwatch, ShadowLevel, FontSize, LineHeight } from '../types'
+import type { DesignSystemConfig } from '../types'
 import { useDesignConfig } from '../composables/useDesignConfig'
 
 const model = defineModel<DesignSystemConfig>('config', { required: true })
@@ -83,12 +83,12 @@ function onResetClick(): void {
   emitReset('reset')
 }
 
-const primarySwatches = model.value.colors.primary as ColorSwatch[]
-const secondarySwatches = model.value.colors.secondary as ColorSwatch[]
-const neutralSwatches = model.value.colors.neutral as ColorSwatch[]
-const fontSizes = model.value.typography.fontSizes as FontSize[]
-const lineHeights = model.value.typography.lineHeights as LineHeight[]
-const shadowLevels = model.value.shadows.levels as ShadowLevel[]
+const primarySwatches = model.value.colors.primary
+const secondarySwatches = model.value.colors.secondary
+const neutralSwatches = model.value.colors.neutral
+const fontSizes = model.value.typography.fontSizes
+const lineHeights = model.value.typography.lineHeights
+const shadowLevels = model.value.shadows.levels
 </script>
 
 <template>

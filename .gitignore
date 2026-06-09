@@ -23,3 +23,6 @@ dist-tsc
 *.njsproj
 *.sln
 *.sw?
+
+# Test outputs
+export-test-output/

@@ -1,17 +1,37 @@
 <script setup lang="ts">
 import type { Collaborator } from '../types'
 
-defineProps<{
+withDefaults(defineProps<{
   me: Collaborator | null
   others: readonly Collaborator[]
   totalCount: number
   isEnabled: boolean
   isConnected: boolean
-}>()
+  collabMode?: 'webrtc' | 'websocket'
+}>(), {
+  me: null,
+  others: () => [],
+  totalCount: 0,
+  isEnabled: false,
+  isConnected: false,
+  collabMode: undefined
+})
 
 const emit = defineEmits<{
   (e: 'toggle'): void
 }>()
+
+function modeLabel(mode?: 'webrtc' | 'websocket'): string {
+  if (mode === 'websocket') return 'WS'
+  if (mode === 'webrtc') return 'P2P'
+  return ''
+}
+
+function modeTitle(mode?: 'webrtc' | 'websocket'): string {
+  if (mode === 'websocket') return 'WebSocket 中转模式（严格 NAT/企业内网推荐）'
+  if (mode === 'webrtc') return 'WebRTC 点对点模式（同网络推荐）'
+  return ''
+}
 </script>
 
 <template>
@@ -34,6 +54,14 @@ const emit = defineEmits<{
       </span>
       <span class="toggle-text">
         {{ isEnabled ? (isConnected ? '协作已连接' : '连接中…') : '开启协作' }}
+      </span>
+      <span
+        v-if="isEnabled && collabMode"
+        class="mode-tag"
+        :class="collabMode"
+        :title="modeTitle(collabMode)"
+      >
+        {{ modeLabel(collabMode) }}
       </span>
     </button>
 
@@ -119,6 +147,24 @@ const emit = defineEmits<{
 
 .toggle-text {
   color: inherit;
+}
+
+.mode-tag {
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  letter-spacing: 0.05em;
+}
+
+.mode-tag.webrtc {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.mode-tag.websocket {
+  background: #cffafe;
+  color: #0e7490;
 }
 
 .avatars-stack {

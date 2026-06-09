@@ -9,21 +9,29 @@
   },
   "scripts": {
     "dev": "vite",
+    "dev:ws": "VITE_COLLAB_MODE=websocket VITE_WEBSOCKET_URL=ws://localhost:1234 vite",
+    "dev:webrtc": "VITE_COLLAB_MODE=webrtc VITE_SIGNALING_URLS=ws://localhost:4444 vite",
+    "signaling": "PORT=4444 node scripts/signaling-server.js",
+    "websocket-server": "HOST=0.0.0.0 PORT=1234 npx y-websocket",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "test:exports": "tsx scripts/test-exports.ts"
   },
   "dependencies": {
-    "vue": "^3.4.21",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.2",
-    "yjs": "^13.6.14",
-    "y-webrtc": "^10.3.0"
+    "vue": "^3.4.21",
+    "y-webrtc": "^10.3.0",
+    "yjs": "^13.6.14"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.4",
+    "tsx": "^4.22.4",
     "typescript": "~5.4.0",
     "vite": "^5.2.0",
-    "vue-tsc": "^2.0.0"
+    "vue-tsc": "^2.0.0",
+    "ws": "^8.21.0",
+    "y-websocket": "^2.1.0"
   }
 }
